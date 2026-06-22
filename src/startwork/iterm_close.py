@@ -24,7 +24,10 @@ async def main(connection: iterm2.Connection, session_id: str) -> None:
             for session in tab.sessions:
                 name = session.name or ""
                 if session_id in name:
-                    await window.async_close()
+                    # force=True: skip iTerm's "a process is running, close?"
+                    # confirmation dialog, which otherwise blocks the API call
+                    # indefinitely (the panes run live agent CLIs).
+                    await window.async_close(force=True)
                     return
 
     # No matching window — not an error (already closed)

@@ -46,10 +46,15 @@ pub fn build_human_control_signal_request(
     }
 }
 
+// Session-cleanup Temporal signaling is retained but OFF the live path: teardown
+// is now SQLite + direct iTerm close (see stopwork). Kept for a future opt-in
+// cleanup workflow; covered by unit tests below.
+#[allow(dead_code)]
 pub fn workflow_id_for_session_cleanup(repo_id: &str, session_id: &str, run_id: &str) -> String {
     format!("devorch/{}/{}/{}/cleanup", repo_id, session_id, run_id)
 }
 
+#[allow(dead_code)]
 pub fn build_cleanup_request(
     namespace: &str,
     workflow_id: &str,
@@ -156,6 +161,7 @@ pub async fn signal_human_control_command(
     }
 }
 
+#[allow(dead_code)]
 pub async fn signal_cleanup_request(
     addr: &str,
     namespace: &str,

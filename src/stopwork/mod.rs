@@ -171,11 +171,6 @@ pub async fn stop_session(
 
     let mut worktree_paths = Vec::new();
     for agent in &agents {
-        // Orchestrator uses repo root and does not have a worker worktree to remove.
-        if agent.role == "orchestrator" {
-            continue;
-        }
-
         if options.preserve_worktrees {
             println!(
                 "Preserving worktree '{}' for agent '{}'",
@@ -184,17 +179,27 @@ pub async fn stop_session(
             continue;
         }
 
-        let branch_status = Command::new("git")
-            .args(["branch", "-D", &agent.branch])
-            .status()
-            .await;
-        match branch_status {
-            Ok(s) if s.success() => println!("Deleted git branch '{}'", agent.branch),
-            _ => println!("Failed to delete branch '{}' or not found", agent.branch),
-        }
+        // Safety: only ever touch worktrees under `.claude/worktrees/` — never the
+        // repo root (which is what a misconfigured/legacy orchestrator could carry).
+        let marker = "/.claude/worktrees/";
+        let Some(idx) = agent.worktree_path.find(marker) else {
+            continue;
+        };
+        // Derive the repo root from the worktree path so git runs correctly
+        // regardless of the caller's cwd.
+        let repo_root = &agent.worktree_path[..idx];
 
+        // Remove the worktree FIRST: a branch that is still checked out in a
+        // worktree cannot be deleted (`git branch -D` would fail). Order matters.
         let wt_status = Command::new("git")
-            .args(["worktree", "remove", "--force", &agent.worktree_path])
+            .args([
+                "-C",
+                repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                &agent.worktree_path,
+            ])
             .status()
             .await;
         match wt_status {
@@ -204,7 +209,7 @@ pub async fn stop_session(
             }
             _ => {
                 let _ = Command::new("git")
-                    .args(["worktree", "prune"])
+                    .args(["-C", repo_root, "worktree", "prune"])
                     .status()
                     .await;
                 println!(
@@ -212,6 +217,16 @@ pub async fn stop_session(
                     agent.worktree_path
                 );
             }
+        }
+
+        // THEN delete the branch (now unreferenced by any worktree).
+        let branch_status = Command::new("git")
+            .args(["-C", repo_root, "branch", "-D", &agent.branch])
+            .status()
+            .await;
+        match branch_status {
+            Ok(s) if s.success() => println!("Deleted git branch '{}'", agent.branch),
+            _ => println!("Failed to delete branch '{}' or not found", agent.branch),
         }
     }
 
