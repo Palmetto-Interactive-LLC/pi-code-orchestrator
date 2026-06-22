@@ -169,66 +169,7 @@ pub async fn stop_session(
     let agents = crate::db::queries::get_agents_for_session(pool, session_id).await?;
     println!("Found {} agents to clean up in SQLite", agents.len());
 
-    let mut worktree_paths = Vec::new();
-    for agent in &agents {
-        if options.preserve_worktrees {
-            println!(
-                "Preserving worktree '{}' for agent '{}'",
-                agent.worktree_path, agent.id
-            );
-            continue;
-        }
-
-        // Safety: only ever touch worktrees under `.claude/worktrees/` — never the
-        // repo root (which is what a misconfigured/legacy orchestrator could carry).
-        let marker = "/.claude/worktrees/";
-        let Some(idx) = agent.worktree_path.find(marker) else {
-            continue;
-        };
-        // Derive the repo root from the worktree path so git runs correctly
-        // regardless of the caller's cwd.
-        let repo_root = &agent.worktree_path[..idx];
-
-        // Remove the worktree FIRST: a branch that is still checked out in a
-        // worktree cannot be deleted (`git branch -D` would fail). Order matters.
-        let wt_status = Command::new("git")
-            .args([
-                "-C",
-                repo_root,
-                "worktree",
-                "remove",
-                "--force",
-                &agent.worktree_path,
-            ])
-            .status()
-            .await;
-        match wt_status {
-            Ok(s) if s.success() => {
-                println!("Removed git worktree '{}'", agent.worktree_path);
-                worktree_paths.push(agent.worktree_path.clone());
-            }
-            _ => {
-                let _ = Command::new("git")
-                    .args(["-C", repo_root, "worktree", "prune"])
-                    .status()
-                    .await;
-                println!(
-                    "Failed to remove worktree '{}', ran git worktree prune",
-                    agent.worktree_path
-                );
-            }
-        }
-
-        // THEN delete the branch (now unreferenced by any worktree).
-        let branch_status = Command::new("git")
-            .args(["-C", repo_root, "branch", "-D", &agent.branch])
-            .status()
-            .await;
-        match branch_status {
-            Ok(s) if s.success() => println!("Deleted git branch '{}'", agent.branch),
-            _ => println!("Failed to delete branch '{}' or not found", agent.branch),
-        }
-    }
+    let worktree_paths = cleanup_agent_worktrees(&agents, options.preserve_worktrees).await;
 
     // 3. Clean up empty parent directories.
     if !options.preserve_worktrees {
@@ -279,9 +220,190 @@ pub async fn stop_session(
     Ok(())
 }
 
+/// Remove each agent's git worktree and then its branch, in that order.
+///
+/// Order is load-bearing: a branch that is still checked out in a worktree
+/// cannot be deleted, so the worktree MUST be removed first. Applies to every
+/// agent including the orchestrator (which has its own worktree, not repo root).
+/// Only paths under `.claude/worktrees/` are touched — the repo root is never
+/// removed. Returns the list of worktree paths actually removed.
+async fn cleanup_agent_worktrees(
+    agents: &[crate::types::Agent],
+    preserve_worktrees: bool,
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    for agent in agents {
+        if preserve_worktrees {
+            println!(
+                "Preserving worktree '{}' for agent '{}'",
+                agent.worktree_path, agent.id
+            );
+            continue;
+        }
+
+        // Safety: only ever touch worktrees under `.claude/worktrees/`.
+        let marker = "/.claude/worktrees/";
+        let Some(idx) = agent.worktree_path.find(marker) else {
+            continue;
+        };
+        // Derive the repo root so git runs correctly regardless of cwd.
+        let repo_root = &agent.worktree_path[..idx];
+
+        // Remove the worktree FIRST (a checked-out branch can't be deleted).
+        let wt_status = Command::new("git")
+            .args([
+                "-C",
+                repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                &agent.worktree_path,
+            ])
+            .status()
+            .await;
+        match wt_status {
+            Ok(s) if s.success() => {
+                println!("Removed git worktree '{}'", agent.worktree_path);
+                removed.push(agent.worktree_path.clone());
+            }
+            _ => {
+                let _ = Command::new("git")
+                    .args(["-C", repo_root, "worktree", "prune"])
+                    .status()
+                    .await;
+                println!(
+                    "Failed to remove worktree '{}', ran git worktree prune",
+                    agent.worktree_path
+                );
+            }
+        }
+
+        // THEN delete the branch (now unreferenced by any worktree).
+        let branch_status = Command::new("git")
+            .args(["-C", repo_root, "branch", "-D", &agent.branch])
+            .status()
+            .await;
+        match branch_status {
+            Ok(s) if s.success() => println!("Deleted git branch '{}'", agent.branch),
+            _ => println!("Failed to delete branch '{}' or not found", agent.branch),
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_agent(role: &str, worktree_path: &str, branch: &str) -> crate::types::Agent {
+        crate::types::Agent {
+            id: format!("agent-{role}"),
+            session_id: "s-1".to_string(),
+            role: role.to_string(),
+            pane_id: None,
+            worktree_path: worktree_path.to_string(),
+            branch: branch.to_string(),
+            agent_kind: "claude".to_string(),
+            status: "idle".to_string(),
+            last_seen_at: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Hermetic real-git proof that stopwork teardown removes EVERY worktree and
+    /// branch — including the orchestrator's — in the correct order (worktree
+    /// before branch, otherwise `git branch -D` fails on a checked-out branch).
+    #[tokio::test]
+    async fn cleanup_removes_all_worktrees_and_branches_including_orchestrator() {
+        use std::process::Command as Git;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        let run = |args: &[&str]| {
+            let ok = Git::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.co"]);
+        run(&["config", "user.name", "t"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "seed"]);
+
+        let wroot = repo.join(".claude/worktrees/s-1");
+        std::fs::create_dir_all(&wroot).unwrap();
+        let specs = [("orchestrator", "s-1"), ("ai", "s-ai-1"), ("dat", "s-dat-1")];
+        let mut agents = Vec::new();
+        for (role, branch) in specs {
+            let wt = wroot.join(branch);
+            run(&["worktree", "add", "-b", branch, wt.to_str().unwrap()]);
+            agents.push(make_agent(role, wt.to_str().unwrap(), branch));
+        }
+
+        let removed = cleanup_agent_worktrees(&agents, false).await;
+        assert_eq!(removed.len(), 3, "all three worktrees should be removed");
+
+        let wt_out = String::from_utf8_lossy(
+            &Git::new("git")
+                .args(["worktree", "list"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .to_string();
+        assert!(
+            !wt_out.contains(".claude/worktrees/s-1"),
+            "no session worktrees should remain:\n{wt_out}"
+        );
+
+        let br_out = String::from_utf8_lossy(
+            &Git::new("git")
+                .args(["branch", "--list"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .to_string();
+        for (_, b) in specs {
+            assert!(!br_out.contains(b), "branch {b} should be deleted:\n{br_out}");
+            assert!(!wroot.join(b).exists(), "worktree dir {b} should be gone");
+        }
+    }
+
+    /// preserve_worktrees must keep everything in place.
+    #[tokio::test]
+    async fn cleanup_preserves_when_requested() {
+        use std::process::Command as Git;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t.co"],
+            vec!["config", "user.name", "t"],
+            vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+        ] {
+            Git::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+        }
+        let wt = repo.join(".claude/worktrees/s-2/s-ai-2");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        Git::new("git")
+            .args(["worktree", "add", "-b", "s-ai-2", wt.to_str().unwrap()])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        let agents = vec![make_agent("ai", wt.to_str().unwrap(), "s-ai-2")];
+        let removed = cleanup_agent_worktrees(&agents, true).await;
+        assert!(removed.is_empty(), "nothing removed when preserving");
+        assert!(wt.exists(), "worktree must be preserved");
+    }
 
     #[test]
     fn resolves_explicit_session_first() {

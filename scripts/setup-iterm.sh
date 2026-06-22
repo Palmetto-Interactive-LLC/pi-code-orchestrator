@@ -67,11 +67,19 @@ ensure_iterm2_app() {
 
 install_iterm2_python_package() {
     local py="$1"
+    # Idempotent: if iterm2 already imports, do NOT re-run pip. Re-installing the
+    # package (uninstall/reinstall) while iTerm2 is RUNNING can disrupt its live
+    # Python API server socket and wedge startwork until iTerm2 restarts. Only
+    # install when genuinely missing.
+    if "$py" -c "import iterm2" >/dev/null 2>&1; then
+        log "INFO: iterm2 Python package already present for $py (skipping pip)"
+        return 0
+    fi
     log "INFO: Installing iterm2 Python package for $py..."
     "$py" -m pip install --user --upgrade pip >/dev/null 2>&1 || true
-    if ! "$py" -m pip install --user --upgrade 'iterm2>=2.0'; then
+    if ! "$py" -m pip install --user 'iterm2>=2.0'; then
         # Homebrew Python may require this flag on some macOS versions.
-        "$py" -m pip install --user --upgrade --break-system-packages 'iterm2>=2.0'
+        "$py" -m pip install --user --break-system-packages 'iterm2>=2.0'
     fi
     "$py" -c "import iterm2; print('iterm2 ok')"
 }
