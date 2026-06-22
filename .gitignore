@@ -1,0 +1,18 @@
+/target
+node_modules/
+.claude/
+.gemini/
+.kimi/
+*.log
+.DS_Store
+
+target/
+
+# Credential-risk / machine-local artifacts
+.envrc
+.env
+*.env
+!.env.example
+.cloud-context
+.cloud-auth-backups/
+deploy_log.txt

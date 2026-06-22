@@ -1,0 +1,70 @@
+labels:
+  - name: type:epic
+    color: "5319e7"
+    description: Large coordinated body of work spanning multiple issues
+  - name: type:task
+    color: "1f883d"
+    description: Implementation or documentation task
+  - name: type:migration
+    color: "fbca04"
+    description: Database or data migration work
+  - name: type:validation
+    color: "0e8a16"
+    description: Testing, verification, or evidence work
+  - name: priority:p0
+    color: b60205
+    description: Critical path, highest priority
+  - name: priority:p1
+    color: d93f0b
+    description: Important follow-up priority
+  - name: status:ready
+    color: "0e8a16"
+    description: Ready to pick up
+  - name: team:platform
+    color: "0366d6"
+    description: Platform/runtime ownership
+  - name: team:ops
+    color: "0052cc"
+    description: Operations, launcher, lifecycle, and recovery ownership
+  - name: team:docs
+    color: "0075ca"
+    description: Documentation ownership
+  - name: team:dat
+    color: "006b75"
+    description: Data, database, and projection ownership
+  - name: team:qa
+    color: "0e8a16"
+    description: Quality and validation ownership
+  - name: team:ai
+    color: "6f42c1"
+    description: AI/message compression ownership
+  - name: team:sec
+    color: d4c5f9
+    description: Security and identity ownership
+  - name: team:ui
+    color: c5def5
+    description: Operator interface and CLI UX ownership
+  - name: risk:breaking-change
+    color: d73a4a
+    description: Breaking behavior or compatibility risk
+  - name: risk:migration
+    color: "fbca04"
+    description: Migration or data compatibility risk
+  - name: workflow:operational-debt
+    color: "7057ff"
+    description: Operational debt and resilience workflow
+  - name: wave:0
+    color: bfd4f2
+    description: Wave 0 planning, contracts, and standards
+  - name: wave:1
+    color: c2e0c6
+    description: Wave 1 unsafe runtime path removal
+  - name: wave:2
+    color: d4c5f9
+    description: Wave 2 Temporal control plane
+  - name: wave:3
+    color: fef2c0
+    description: Wave 3 Rust launcher, schema, supervisor, commands
+  - name: wave:4
+    color: f9d0c4
+    description: Wave 4 tests, docs, and resilience evidence

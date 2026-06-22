@@ -1,0 +1,76 @@
+name: Epic
+description: Track a coordinated body of work across multiple issues.
+title: "Epic: "
+labels:
+  - type:epic
+  - priority:p0
+  - status:ready
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for top-level epics. Keep each section focused and concrete.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Briefly state what the epic is and why it matters.
+      placeholder: One-paragraph summary.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Explain the background, constraints, and why the work is needed now.
+      placeholder: Relevant background, constraints, and problem statement.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Describe what is in scope and what is explicitly out of scope.
+      placeholder: In-scope and out-of-scope items.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: List the observable outcomes required for completion.
+      placeholder: Use a markdown checklist if helpful.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Describe the checks that prove the epic is complete.
+      placeholder: Commands, tests, reviews, or evidence requirements.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: List blocking issues, repositories, migrations, or decisions.
+      placeholder: "#1, related issues, external dependencies."
+    validations:
+      required: true
+  - type: textarea
+    id: owned_files
+    attributes:
+      label: Owned Files
+      description: List the files, directories, or modules this epic owns.
+      placeholder: ".github/**, src/**, docs/**"
+    validations:
+      required: true
+  - type: textarea
+    id: issue_breakdown
+    attributes:
+      label: Issue Breakdown
+      description: Break the epic into waves or sub-issues.
+      placeholder: Use issue numbers, waves, and short descriptions.
+    validations:
+      required: true

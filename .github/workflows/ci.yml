@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust-fmt:
+    name: Rust fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+      # NOTE: cargo check / clippy / test are intentionally omitted for now —
+      # the sqlx-backed build needs a reproducible CI build env (toolchain pin
+      # and/or a DB service or committed .sqlx offline cache). Tracked as a
+      # follow-up so this gate stays reliably green.
+
+  ts-typecheck:
+    name: TypeScript typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No `version:` — pnpm/action-setup reads packageManager (pnpm@10.x) from
+      # package.json; specifying both errors with "multiple versions specified".
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck

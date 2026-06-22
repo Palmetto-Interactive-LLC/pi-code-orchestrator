@@ -1,0 +1,83 @@
+name: Sub-issue
+description: Track a single implementable task under an epic.
+title: "Task: "
+labels:
+  - type:task
+  - status:ready
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for a single task that belongs under an epic. Keep the task narrowly scoped.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Briefly state the task and its intended outcome.
+      placeholder: One-paragraph summary.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Explain the surrounding work, constraints, and key assumptions.
+      placeholder: Relevant background and constraints.
+    validations:
+      required: true
+  - type: input
+    id: parent_issue
+    attributes:
+      label: Parent Issue
+      description: Reference the parent epic or tracking issue.
+      placeholder: "#1"
+    validations:
+      required: true
+  - type: input
+    id: wave
+    attributes:
+      label: Wave
+      description: Identify the implementation wave.
+      placeholder: "wave:0"
+    validations:
+      required: true
+  - type: textarea
+    id: owned_files
+    attributes:
+      label: Owned Files
+      description: List the files, directories, or modules this task owns.
+      placeholder: "src/**, docs/**, .github/**"
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Describe the exact work to do and what is out of scope.
+      placeholder: In-scope and out-of-scope items.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: List the observable outcomes required for completion.
+      placeholder: Use a markdown checklist if helpful.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Describe the checks that prove the task is complete.
+      placeholder: Commands, tests, reviews, or evidence requirements.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: List blocking issues, repositories, migrations, or decisions.
+      placeholder: "#1, related issues, external dependencies."
+    validations:
+      required: true
