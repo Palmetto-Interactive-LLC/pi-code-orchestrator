@@ -1,5 +1,5 @@
 use crate::types::*;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
 pub async fn insert_machine(pool: &SqlitePool, machine_id: &str) -> anyhow::Result<()> {
@@ -344,6 +344,207 @@ pub async fn delete_leases_by_session_agents(
     }
 
     Ok(total_removed)
+}
+
+// ── Blackboard discovery cards (migration 007) ────────────────────────────────
+
+/// A shared insight posted by a worker on complete/blocked/failed and read back
+/// into every dispatch prompt for the session.
+#[derive(Debug, Clone)]
+pub struct DiscoveryCard {
+    pub card_id: String,
+    pub role: String,
+    pub category: String,
+    pub summary: String,
+    pub solution: String,
+}
+
+/// Insert a discovery card, deduped by `card_id` (INSERT OR IGNORE mirrors the
+/// TS blackboard's `cards.some(c => c.card_id === card.card_id)` guard).
+pub async fn insert_discovery_card(
+    pool: &SqlitePool,
+    session_id: &str,
+    card: &DiscoveryCard,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO discovery_cards \
+         (card_id, session_id, role, category, summary, solution, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&card.card_id)
+    .bind(session_id)
+    .bind(&card.role)
+    .bind(&card.category)
+    .bind(&card.summary)
+    .bind(&card.solution)
+    .bind(Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// List all discovery cards for a session, oldest first (dispatch-prompt order).
+pub async fn list_discovery_cards(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> anyhow::Result<Vec<DiscoveryCard>> {
+    let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT card_id, role, category, summary, solution \
+         FROM discovery_cards WHERE session_id = ? ORDER BY created_at ASC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(card_id, role, category, summary, solution)| DiscoveryCard {
+                card_id,
+                role,
+                category,
+                summary,
+                solution,
+            },
+        )
+        .collect())
+}
+
+// ── MCP event subscriptions (migration 007) ───────────────────────────────────
+
+/// Register a role's subscription to an event type for a session (idempotent).
+pub async fn add_subscription(
+    pool: &SqlitePool,
+    session_id: &str,
+    event_type: &str,
+    role: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO mcp_subscriptions (session_id, event_type, role) VALUES (?, ?, ?)",
+    )
+    .bind(session_id)
+    .bind(event_type)
+    .bind(role)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// List the roles subscribed to `event_type` in `session_id`.
+pub async fn list_subscribed_roles(
+    pool: &SqlitePool,
+    session_id: &str,
+    event_type: &str,
+) -> anyhow::Result<Vec<String>> {
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT role FROM mcp_subscriptions WHERE session_id = ? AND event_type = ?",
+    )
+    .bind(session_id)
+    .bind(event_type)
+    .fetch_all(pool)
+    .await?;
+    Ok(roles)
+}
+
+// ── Nudge clock + active-task tracking (migration 007) ─────────────────────────
+
+/// Advance an agent's last_signal_at (silence clock reset) and mark it busy on a
+/// given active task. Called on dispatch / peer / transition — NOT heartbeat.
+/// `active_task: None` leaves the existing active_task untouched.
+pub async fn mark_agent_signal(
+    pool: &SqlitePool,
+    agent_id: &str,
+    active_task: Option<&str>,
+    busy: bool,
+) -> anyhow::Result<()> {
+    let now = Utc::now().to_rfc3339();
+    match active_task {
+        Some(task) => {
+            sqlx::query(
+                "UPDATE agents SET last_signal_at = ?, busy = ?, active_task = ? WHERE id = ?",
+            )
+            .bind(&now)
+            .bind(busy as i64)
+            .bind(task)
+            .bind(agent_id)
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query("UPDATE agents SET last_signal_at = ?, busy = ? WHERE id = ?")
+                .bind(&now)
+                .bind(busy as i64)
+                .bind(agent_id)
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Clear an agent's busy/active-task state (e.g. on complete/failed).
+pub async fn clear_agent_active_task(pool: &SqlitePool, agent_id: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE agents SET busy = 0, active_task = NULL WHERE id = ?")
+        .bind(agent_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A busy agent the nudge loop may need to poke. Times are raw RFC3339 strings.
+pub struct NudgeCandidate {
+    pub agent_id: String,
+    pub session_id: String,
+    pub role: String,
+    pub active_task: String,
+    pub last_signal_at: Option<DateTime<Utc>>,
+    pub last_nudge_at: Option<DateTime<Utc>>,
+}
+
+/// All agents that are busy with an active task — candidates for the nudge scan.
+pub async fn get_nudge_candidates(pool: &SqlitePool) -> anyhow::Result<Vec<NudgeCandidate>> {
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT id, session_id, role, active_task, last_signal_at, last_nudge_at \
+         FROM agents WHERE busy = 1 AND active_task IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(agent_id, session_id, role, active_task, last_signal_at, last_nudge_at)| {
+                NudgeCandidate {
+                    agent_id,
+                    session_id,
+                    role,
+                    active_task,
+                    last_signal_at: last_signal_at
+                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|t| t.with_timezone(&Utc)),
+                    last_nudge_at: last_nudge_at
+                        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|t| t.with_timezone(&Utc)),
+                }
+            },
+        )
+        .collect())
+}
+
+/// Stamp last_nudge_at = now for an agent (nudge throttle).
+pub async fn mark_agent_nudged(pool: &SqlitePool, agent_id: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE agents SET last_nudge_at = ? WHERE id = ?")
+        .bind(Utc::now().to_rfc3339())
+        .bind(agent_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

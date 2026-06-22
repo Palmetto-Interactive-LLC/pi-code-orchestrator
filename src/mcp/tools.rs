@@ -2,11 +2,196 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
-use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::db::queries;
+use crate::db::queries::DiscoveryCard;
+use crate::delivery::inject;
 use crate::types::{generate_id, Acknowledgement, PeerMessage, StatusReport};
+
+const WORKER_ROLES: &[&str] = &["ai", "dat", "sec", "ops", "plt", "ui", "doc", "qa"];
+
+/// Push statuses that get mirrored to the orchestrator pane as a notification.
+const PUSH_STATUSES: &[&str] = &[
+    "ack",
+    "complete",
+    "blocked",
+    "failed",
+    "degraded",
+    "recovered",
+];
+
+// ── byte-exact injected templates (parity with the former TS workflows) ───────
+
+/// `[orchestrator:dispatch]` prompt → target worker pane (formatDispatchPrompt).
+fn format_dispatch_prompt(
+    message_id: &str,
+    task_id: &str,
+    from_role: &str,
+    summary: &str,
+    cards: &[DiscoveryCard],
+    files: &[String],
+    next_action: Option<&str>,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("[orchestrator:dispatch]".to_string());
+    lines.push(format!("message_id={message_id}"));
+    lines.push(format!("task_id={task_id}"));
+    let from = if from_role.is_empty() {
+        "orchestrator"
+    } else {
+        from_role
+    };
+    lines.push(format!("from={from}"));
+    lines.push(String::new());
+    lines.push(summary.to_string());
+
+    if !cards.is_empty() {
+        lines.push(String::new());
+        lines.push("Active Blackboard Discovery Cards (Shared Insights):".to_string());
+        for card in cards {
+            lines.push(format!(
+                "  - [{} by {}] {}",
+                card.category.to_uppercase(),
+                card.role,
+                card.summary
+            ));
+            lines.push(format!("    Solution: {}", card.solution));
+        }
+    }
+    if !files.is_empty() {
+        lines.push(String::new());
+        lines.push("Files:".to_string());
+        for f in files {
+            lines.push(format!("  - {f}"));
+        }
+    }
+    if let Some(na) = next_action {
+        lines.push(String::new());
+        lines.push(format!("Next: {na}"));
+    }
+    if !from_role.is_empty() && from_role != "orchestrator" {
+        lines.push(String::new());
+        lines.push(format!("(from {from_role})"));
+    }
+    lines.push(String::new());
+    lines.push("First acknowledge receipt:".to_string());
+    lines.push(format!(
+        "  signal --status ack --task {task_id} --summary \"received\""
+    ));
+    lines.push(String::new());
+    lines.push("When done:".to_string());
+    lines.push(format!(
+        "  signal --status complete --task {task_id} --summary \"...\" --evidence \"...\""
+    ));
+    lines.push(String::new());
+    lines.push("If blocked:".to_string());
+    lines.push(format!(
+        "  signal --status blocked --task {task_id} --summary \"...\" --blocker \"...\""
+    ));
+    lines.join("\n")
+}
+
+/// `[worker:message]` peer prompt → target worker pane (formatPeerPrompt).
+fn format_peer_prompt(
+    message_id: &str,
+    from: &str,
+    to: &str,
+    task_id: Option<&str>,
+    info: &str,
+    requested_action: Option<&str>,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("[worker:message]".to_string());
+    lines.push(format!("message_id={message_id}"));
+    lines.push(format!("from={from}"));
+    lines.push(format!("to={to}"));
+    if let Some(t) = task_id {
+        lines.push(format!("task_id={t}"));
+    }
+    lines.push(String::new());
+    lines.push(info.to_string());
+    if let Some(ra) = requested_action {
+        lines.push(String::new());
+        lines.push(format!("Requested: {ra}"));
+    }
+    lines.join("\n")
+}
+
+/// Orchestrator-pane status-notification line (push-status transition).
+fn format_status_line(
+    role: &str,
+    status: &str,
+    task_id: Option<&str>,
+    summary: Option<&str>,
+    evidence: Option<&str>,
+    next_action: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = vec![format!("[{role} {status}]")];
+    if let Some(t) = task_id {
+        parts.push(format!("task={t}"));
+    }
+    if let Some(s) = summary {
+        parts.push(s.to_string());
+    }
+    if let Some(e) = evidence {
+        parts.push(format!("evidence={e}"));
+    }
+    if let Some(n) = next_action {
+        parts.push(format!("next={n}"));
+    }
+    format!("{}\n", parts.join(" "))
+}
+
+/// Orchestrator-pane peer line (peer message to == orchestrator). `→` = U+2192.
+fn format_orchestrator_peer_line(
+    from: &str,
+    task_id: Option<&str>,
+    info: &str,
+    requested_action: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = vec![format!("[peer {from} \u{2192} orchestrator]")];
+    if let Some(t) = task_id {
+        parts.push(format!("task={t}"));
+    }
+    parts.push(info.to_string());
+    if let Some(ra) = requested_action {
+        parts.push(format!("action={ra}"));
+    }
+    format!("{}\n", parts.join(" "))
+}
+
+/// MCP event broadcast text → busy subscribed worker pane.
+fn format_mcp_event(event_type: &str, publisher: &str, payload: &Value) -> String {
+    format!(
+        "\n\n>>> [MCP EVENT BROADCAST] <<<\nEvent: {event_type} from {publisher}\nPayload: {}\n\n",
+        payload
+    )
+}
+
+/// Best-effort direct injection into a role's pane. A missing pane is logged and
+/// swallowed (parity with the TS `catch { /* degraded pane */ }` blocks): SQLite
+/// is already the source of truth, so delivery failure must never be fatal.
+async fn try_inject(pool: &SqlitePool, session: &str, role: &str, text: &str) {
+    if let Err(e) = inject::deliver_to_role(pool, session, role, text).await {
+        warn!(session = %session, role = %role, error = %e, "pane injection failed (degraded pane)");
+    }
+}
+
+/// Resolve the SQLite `sessions.id` for a `name-N` session string, if present.
+async fn resolve_session_id(pool: &SqlitePool, session: &str) -> Option<String> {
+    let (project_slug, slot) = parse_session(session).ok()?;
+    sqlx::query_as::<_, (String,)>(
+        "SELECT id FROM sessions WHERE project_slug = ? AND slot_number = ?",
+    )
+    .bind(&project_slug)
+    .bind(slot)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .map(|(id,)| id)
+}
 
 fn enforce_scope(args: &Value, source: &str) -> anyhow::Result<()> {
     let team_id = args
@@ -230,82 +415,61 @@ pub async fn handle_report_status(pool: &SqlitePool, args: Value) -> anyhow::Res
     };
     queries::update_agent_status(pool, &agent.id, agent_status).await?;
 
-    // 6. Signal Temporal (orch.stateTransition) on every status report.
-    {
-        let message_id = generate_id("trans");
-        let now = Utc::now().to_rfc3339();
-        let transition_payload = json!({
-            "message_id": message_id,
-            "task_id": report.task_id,
-            "role": report.role,
-            "status": report.status,
-            "summary": report.summary,
-            "evidence": report.validation,
-            "next_action": report.next_action,
-            "timestamp": now,
-        });
-
-        // Write to durable SQLite inbox first
-        if let Ok((project_slug, slot)) = parse_session(&report.session) {
-            let session_row: Option<(String,)> = sqlx::query_as(
-                "SELECT id FROM sessions WHERE project_slug = ? AND slot_number = ?",
-            )
-            .bind(&project_slug)
-            .bind(slot)
-            .fetch_optional(pool)
-            .await?;
-
-            if let Some((session_id,)) = session_row {
-                if let Err(e) = sqlx::query(
-                    "INSERT INTO inbox_messages \
-                     (message_id, session_id, task_id, role, status, summary, evidence, next_action, received_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(&message_id)
-                .bind(&session_id)
-                .bind(&report.task_id)
-                .bind(&report.role)
-                .bind(&report.status)
-                .bind(&report.summary)
-                .bind(&report.validation)
-                .bind(&report.next_action)
-                .bind(&now)
-                .execute(pool)
-                .await {
-                    warn!(error = %e, message_id = %message_id, "Failed to persist to inbox_messages");
-                }
-            }
+    // 5b. Advance the nudge clock and busy/active-task tracking. A status report
+    // counts as a signal (silence-clock reset). complete/failed clear the active
+    // task; everything else keeps the agent busy on its task.
+    match report.status.as_str() {
+        "complete" | "failed" => {
+            let _ = queries::clear_agent_active_task(pool, &agent.id).await;
+            let _ = queries::mark_agent_signal(pool, &agent.id, None, false).await;
         }
-
-        if let Ok(config) = crate::config::Config::load() {
-            let wf_id = orchestrator_wf_id(&report.session);
-            info!(
-                agent_id = %agent.id,
-                status = %report.status,
-                workflow_id = %wf_id,
-                message_id = %message_id,
-                "Signaling orch.stateTransition"
-            );
-            if let Err(e) = temporal_signal(
-                &config.temporal_address,
-                &config.temporal_namespace,
-                &wf_id,
-                "orch.stateTransition",
-                &transition_payload.to_string(),
-            )
-            .await
-            {
-                warn!(
-                    error = %e,
-                    agent_id = %agent.id,
-                    message_id = %message_id,
-                    "orch.stateTransition signal failed — status persisted locally"
-                );
-            }
-        } else {
-            warn!(agent_id = %agent.id, "Config unavailable — skipping orch.stateTransition signal");
+        _ => {
+            let _ =
+                queries::mark_agent_signal(pool, &agent.id, report.task_id.as_deref(), true).await;
         }
     }
+
+    // 6. Durable SQLite inbox write (single source of truth) — replaces the former
+    // orch.stateTransition Temporal signal.
+    let now = Utc::now().to_rfc3339();
+    if let Some(session_id) = resolve_session_id(pool, &report.session).await {
+        let message_id = generate_id("trans");
+        if let Err(e) = sqlx::query(
+            "INSERT INTO inbox_messages \
+             (message_id, session_id, task_id, role, status, summary, evidence, next_action, received_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&message_id)
+        .bind(&session_id)
+        .bind(&report.task_id)
+        .bind(&report.role)
+        .bind(&report.status)
+        .bind(&report.summary)
+        .bind(&report.validation)
+        .bind(&report.next_action)
+        .bind(&now)
+        .execute(pool)
+        .await {
+            warn!(error = %e, message_id = %message_id, "Failed to persist to inbox_messages");
+        }
+    }
+
+    // 6b. On a push status, inject the orchestrator-pane notification line.
+    if PUSH_STATUSES.contains(&report.status.as_str()) {
+        let line = format_status_line(
+            &report.role,
+            &report.status,
+            report.task_id.as_deref(),
+            report.summary.as_deref(),
+            report.validation.as_deref(),
+            report.next_action.as_deref(),
+        );
+        try_inject(pool, &report.session, "orchestrator", &line).await;
+    }
+
+    // 6c. Auto-heal: re-decompose on TypeScript-shaped blockers, resume parents
+    // when an auto-fix completes, and post discovery cards on terminal statuses.
+    handle_auto_heal(pool, &report).await;
 
     // 7. Log event
     let payload = serde_json::to_string(&report).ok();
@@ -323,6 +487,216 @@ pub async fn handle_report_status(pool: &SqlitePool, args: Value) -> anyhow::Res
         "agent_id": agent.id,
         "work_item_updated": work_item_id.is_some()
     }))
+}
+
+/// Persist a dispatch row + inject the dispatch prompt to the target pane. Shared
+/// by `devorch_dispatch_task` and the auto-heal re-decompose/resume paths so all
+/// dispatches are durable and rendered identically (with blackboard cards).
+async fn dispatch_and_inject(
+    pool: &SqlitePool,
+    session: &str,
+    from_role: &str,
+    to_role: &str,
+    task_id: &str,
+    summary: &str,
+    files: &[String],
+    next_action: Option<&str>,
+    priority: &str,
+) -> anyhow::Result<String> {
+    let message_id = format!(
+        "dispatch-{}-{}",
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("x"),
+        Utc::now().timestamp_millis()
+    );
+    let created_at = Utc::now().to_rfc3339();
+    let files_json = serde_json::to_string(files)?;
+
+    sqlx::query(
+        "INSERT INTO dispatches \
+         (message_id, session_id, task_id, from_role, to_role, summary, files, next_action, priority, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&message_id)
+    .bind(session)
+    .bind(task_id)
+    .bind(from_role)
+    .bind(to_role)
+    .bind(summary)
+    .bind(&files_json)
+    .bind(next_action)
+    .bind(priority)
+    .bind(&created_at)
+    .execute(pool)
+    .await?;
+
+    // Load shared blackboard cards for the session and render the prompt.
+    let cards = queries::list_discovery_cards(pool, session)
+        .await
+        .unwrap_or_default();
+    let prompt = format_dispatch_prompt(
+        &message_id,
+        task_id,
+        from_role,
+        summary,
+        &cards,
+        files,
+        next_action,
+    );
+
+    // Mark the target agent busy on this task (advances the nudge clock).
+    if let Ok(agents) = queries::get_agents_for_session(pool, session).await {
+        if let Some(agent) = agents.into_iter().find(|a| a.role == to_role) {
+            let _ = queries::mark_agent_signal(pool, &agent.id, Some(task_id), true).await;
+            let _ = queries::update_agent_status(pool, &agent.id, "busy").await;
+        }
+    }
+
+    try_inject(pool, session, to_role, &prompt).await;
+    Ok(message_id)
+}
+
+/// Auto-heal driven entirely off the just-applied status report (native parity
+/// with the former orchestrator/execution-window workflows):
+///   - blocked + TS-shaped blocker → re-decompose into an `auto-fix-…` task to `ai`
+///   - complete on an `auto-fix-…` task → resume the (still blocked) parent
+///   - complete/blocked/failed → post a discovery card to the shared blackboard
+async fn handle_auto_heal(pool: &SqlitePool, report: &StatusReport) {
+    let session = &report.session;
+
+    match report.status.as_str() {
+        "blocked" => {
+            if let Some(task_id) = report.task_id.as_deref() {
+                let blocker_text = report
+                    .validation
+                    .as_deref()
+                    .or(report.summary.as_deref())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if blocker_text.contains("typescript")
+                    || blocker_text.contains("typecheck")
+                    || blocker_text.contains("exactoptional")
+                {
+                    let sub_task =
+                        format!("auto-fix-{}-{}", task_id, Utc::now().timestamp_millis());
+                    let evidence = report
+                        .validation
+                        .as_deref()
+                        .or(report.summary.as_deref())
+                        .unwrap_or("");
+                    let summary = format!(
+                        "[AUTOMATED TROUBLESHOOTING] Role \"{}\" is BLOCKED on task \"{}\" due to TypeScript/compilation errors:\n\n{}\n\nPlease inspect the workspace, fix any type/compilation errors, ensure package typecheck passes, and signal complete.",
+                        report.role, task_id, evidence
+                    );
+                    if let Err(e) = dispatch_and_inject(
+                        pool,
+                        session,
+                        "orchestrator",
+                        "ai",
+                        &sub_task,
+                        &summary,
+                        &[],
+                        None,
+                        "high",
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "auto re-decompose dispatch failed");
+                    }
+                }
+            }
+        }
+        "complete" => {
+            if let Some(task_id) = report.task_id.as_deref() {
+                if let Some(stripped) = task_id.strip_prefix("auto-fix-") {
+                    // parentTaskId = task_id.split('-')[2..len-1].join('-'): drop the
+                    // `auto-fix-` prefix and the trailing `-{millis}` component.
+                    let parent = match stripped.rsplit_once('-') {
+                        Some((parent, _millis)) if !parent.is_empty() => parent.to_string(),
+                        _ => String::new(),
+                    };
+                    if !parent.is_empty() {
+                        // Only resume if the parent is currently blocked.
+                        let blocked_role: Option<String> = sqlx::query_scalar(
+                            "SELECT target_role FROM work_items \
+                             WHERE task_id = ? AND session_id = ? AND status = 'blocked' \
+                             ORDER BY created_at DESC LIMIT 1",
+                        )
+                        .bind(&parent)
+                        .bind(session)
+                        .fetch_optional(pool)
+                        .await
+                        .ok()
+                        .flatten();
+
+                        if let Some(parent_role) = blocked_role {
+                            // Clear the parent's blocked work item(s).
+                            let _ = sqlx::query(
+                                "UPDATE work_items SET status = 'in_progress' \
+                                 WHERE task_id = ? AND session_id = ? AND status = 'blocked'",
+                            )
+                            .bind(&parent)
+                            .bind(session)
+                            .execute(pool)
+                            .await;
+
+                            let resume = "[RESUMED TASK] The blocker has been automatically resolved. Please rerun validation and proceed to completion.";
+                            if let Err(e) = dispatch_and_inject(
+                                pool,
+                                session,
+                                "orchestrator",
+                                &parent_role,
+                                &parent,
+                                resume,
+                                &[],
+                                None,
+                                "high",
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "auto-resume dispatch failed");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Post a discovery card on terminal statuses (parity with emitTransition).
+    if matches!(report.status.as_str(), "complete" | "blocked" | "failed") {
+        let card = DiscoveryCard {
+            card_id: format!(
+                "card-{}-{}-{}",
+                report.task_id.as_deref().unwrap_or("task"),
+                report.role,
+                Utc::now().timestamp_millis()
+            ),
+            role: report.role.clone(),
+            category: if report.status == "blocked" {
+                "typescript".to_string()
+            } else {
+                "environment".to_string()
+            },
+            summary: format!(
+                "{}: {}",
+                report.status.to_uppercase(),
+                report.summary.as_deref().unwrap_or("")
+            ),
+            solution: report
+                .validation
+                .as_deref()
+                .unwrap_or("No details provided.")
+                .to_string(),
+        };
+        if let Err(e) = queries::insert_discovery_card(pool, session, &card).await {
+            warn!(error = %e, "failed to post discovery card");
+        }
+    }
 }
 
 /// Tool: devorch_peer_message
@@ -354,71 +728,52 @@ pub async fn handle_peer_message(pool: &SqlitePool, args: Value) -> anyhow::Resu
         anyhow::bail!("no agent for session {} role {}", msg.session, msg.to_role);
     }
 
-    // Route through the orchestrator workflow's orch.peerRoute signal, which
-    // forwards to the target window (window.peer → injectToAgent PTY write).
-    // Field names must match the TS PeerMessage contract
-    // (message_id/from/to/task_id/info/requested_action/timestamp).
+    // SQLite is the source of truth; delivery is a direct iTerm2 injection.
     let message_id = generate_id("peer");
     let now = Utc::now().to_rfc3339();
-    let peer_payload = json!({
-        "message_id": message_id,
-        "from": msg.from_role,
-        "to": msg.to_role,
-        "task_id": msg.task_id,
-        "info": msg.info,
-        "requested_action": msg.requested_action,
-        "timestamp": now,
-    });
 
-    // If the target is the orchestrator, it relies on the inbox to read messages
     if msg.to_role == "orchestrator" {
-        if let Ok((project_slug, slot)) = parse_session(&msg.session) {
-            if let Ok(Some((session_id,))) = sqlx::query_as::<_, (String,)>(
-                "SELECT id FROM sessions WHERE project_slug = ? AND slot_number = ?",
+        // The orchestrator reads its inbox AND gets a live pane notification line.
+        if let Some(session_id) = resolve_session_id(pool, &msg.session).await {
+            let summary = format!("peer {} \u{2192} orchestrator: {}", msg.from_role, msg.info);
+            let _ = sqlx::query(
+                "INSERT INTO inbox_messages \
+                 (message_id, session_id, task_id, role, status, summary, evidence, next_action, received_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
-            .bind(&project_slug)
-            .bind(slot)
-            .fetch_optional(pool)
-            .await
-            {
-                let summary = format!("peer {} → orchestrator: {}", msg.from_role, msg.info);
-                let _ = sqlx::query(
-                    "INSERT INTO inbox_messages \
-                     (message_id, session_id, task_id, role, status, summary, evidence, next_action, received_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                )
-                .bind(&message_id)
-                .bind(&session_id)
-                .bind(&msg.task_id)
-                .bind(&msg.from_role) // Treat the sender as the role reporting
-                .bind("info") // Status is "info" for a peer message
-                .bind(&summary)
-                .bind::<Option<&str>>(None) // evidence
-                .bind(&msg.requested_action)
-                .bind(&now)
-                .execute(pool)
-                .await;
-            }
+            .bind(&message_id)
+            .bind(&session_id)
+            .bind(&msg.task_id)
+            .bind(&msg.from_role) // sender is the role reporting
+            .bind("info")
+            .bind(&summary)
+            .bind::<Option<&str>>(None)
+            .bind(&msg.requested_action)
+            .bind(&now)
+            .execute(pool)
+            .await;
         }
-    }
-
-    let config = crate::config::Config::load()?;
-    let wf_id = orchestrator_wf_id(&msg.session);
-    info!(message_id = %message_id, from = %msg.from_role, to = %msg.to_role, workflow_id = %wf_id, "Signaling orch.peerRoute");
-    if let Err(e) = temporal_signal(
-        &config.temporal_address,
-        &config.temporal_namespace,
-        &wf_id,
-        "orch.peerRoute",
-        &peer_payload.to_string(),
-    )
-    .await
-    {
-        warn!(error = %e, message_id = %message_id, "orch.peerRoute signal failed — peer message logged locally");
-        return Ok(ok_text(format!(
-            "Peer message logged (message_id: {message_id}) but Temporal signal failed: {e}. \
-             The orchestrator workflow may not be running yet."
-        )));
+        let line = format_orchestrator_peer_line(
+            &msg.from_role,
+            msg.task_id.as_deref(),
+            &msg.info,
+            msg.requested_action.as_deref(),
+        );
+        try_inject(pool, &msg.session, "orchestrator", &line).await;
+    } else {
+        // Worker peer: inject the [worker:message] prompt and advance its clock.
+        let prompt = format_peer_prompt(
+            &message_id,
+            &msg.from_role,
+            &msg.to_role,
+            msg.task_id.as_deref(),
+            &msg.info,
+            msg.requested_action.as_deref(),
+        );
+        if let Some(agent_id) = target_agent_id.as_deref() {
+            let _ = queries::mark_agent_signal(pool, agent_id, None, true).await;
+        }
+        try_inject(pool, &msg.session, &msg.to_role, &prompt).await;
     }
 
     Ok(ok_text(format!(
@@ -563,10 +918,6 @@ fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, Value> {
         .ok_or_else(|| err_text(format!("missing required field: {key}")))
 }
 
-fn orchestrator_wf_id(session: &str) -> String {
-    format!("session:{session}:orchestrator")
-}
-
 fn parse_session(session: &str) -> anyhow::Result<(String, i64)> {
     let last_dash = session.rfind('-').ok_or_else(|| {
         anyhow::anyhow!("invalid session format: expected 'name-N' (e.g. navi-9)")
@@ -576,51 +927,6 @@ fn parse_session(session: &str) -> anyhow::Result<(String, i64)> {
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid session format: slot must be a number"))?;
     Ok((slug.to_string(), slot))
-}
-
-async fn temporal_signal(
-    address: &str,
-    namespace: &str,
-    workflow_id: &str,
-    signal_name: &str,
-    input_json: &str,
-) -> anyhow::Result<()> {
-    let output = Command::new("temporal")
-        .args([
-            "workflow",
-            "signal",
-            "--workflow-id",
-            workflow_id,
-            "--name",
-            signal_name,
-            "--namespace",
-            namespace,
-            "--address",
-            address,
-            "--input",
-            input_json,
-            // Raw value, NOT JSON-quoted: the CLI stores the bytes after `=` as
-            // the encoding metadata. `encoding="json/plain"` (with quotes) makes
-            // the TS SDK reject the signal with `Unknown encoding`.
-            "--input-meta",
-            "encoding=json/plain",
-            "--output",
-            "json",
-        ])
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if !stdout.trim().is_empty() {
-            stdout.into_owned()
-        } else {
-            stderr.into_owned()
-        };
-        anyhow::bail!("{}", detail.trim());
-    }
-    Ok(())
 }
 
 // ── tool 5: devorch_dispatch_task ─────────────────────────────────────────────
@@ -678,80 +984,51 @@ async fn dispatch_task_inner(pool: &SqlitePool, params: &Value) -> anyhow::Resul
         })
         .unwrap_or_default();
 
-    const WORKER_ROLES: &[&str] = &["ai", "dat", "sec", "ops", "plt", "ui", "doc", "qa"];
     if !WORKER_ROLES.contains(&to_role) {
         anyhow::bail!("to_role must be one of: {}", WORKER_ROLES.join(", "));
     }
 
-    let message_id = format!(
-        "dispatch-{}-{}",
-        uuid::Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("x"),
-        Utc::now().timestamp_millis()
-    );
-    let created_at = Utc::now().to_rfc3339();
-    let files_json = serde_json::to_string(&files)?;
-
-    // 1. Persist to local SQLite projection (SQLite-first: survives Temporal outage).
-    sqlx::query(
-        "INSERT INTO dispatches \
-         (message_id, session_id, task_id, from_role, to_role, summary, files, next_action, priority, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-    .bind(&message_id)
-    .bind(session)
-    .bind(task_id)
-    .bind(from_role)
-    .bind(to_role)
-    .bind(summary)
-    .bind(&files_json)
-    .bind(next_action)
-    .bind(priority)
-    .bind(&created_at)
-    .execute(pool)
-    .await?;
-
-    // 2. Signal Temporal (orch.dispatch).
-    let dispatch_payload = json!({
-        "message_id": message_id,
-        "task_id": task_id,
-        "role": to_role,
-        "from_role": from_role,
-        "summary": summary,
-        "files": if files.is_empty() { Value::Null } else { json!(files) },
-        "next_action": next_action,
-        "priority": priority,
-        "created_at": created_at,
-    });
-
-    let config = crate::config::Config::load()?;
-    let wf_id = orchestrator_wf_id(session);
-    info!(
-        message_id = %message_id,
-        workflow_id = %wf_id,
-        to_role = %to_role,
-        task_id = %task_id,
-        "Signaling orch.dispatch"
-    );
-
-    if let Err(e) = temporal_signal(
-        &config.temporal_address,
-        &config.temporal_namespace,
-        &wf_id,
-        "orch.dispatch",
-        &dispatch_payload.to_string(),
-    )
-    .await
-    {
-        warn!(error = %e, message_id = %message_id, "Temporal signal failed — dispatch persisted locally");
-        return Ok(ok_text(format!(
-            "Dispatch persisted (message_id: {message_id}) but Temporal signal failed: {e}. \
-             The orchestrator workflow may not be running yet."
-        )));
+    // Create a leasable work_item so devorch_report_status can resolve the task
+    // later. Best-effort: a missing session row (tests) leaves work_item absent,
+    // which the report path tolerates.
+    if let Ok(agents) = queries::get_agents_for_session(pool, session).await {
+        if let Some(agent) = agents.into_iter().find(|a| a.role == to_role) {
+            let files_json = serde_json::to_string(&files)?;
+            let wi_id = generate_id("wi");
+            let _ = sqlx::query(
+                "INSERT INTO work_items \
+                 (id, session_id, target_role, target_agent_id, task_id, summary, files, next_action, priority, status, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivered', ?)"
+            )
+            .bind(&wi_id)
+            .bind(session)
+            .bind(to_role)
+            .bind(&agent.id)
+            .bind(task_id)
+            .bind(summary)
+            .bind(&files_json)
+            .bind(next_action)
+            .bind(priority)
+            .bind(Utc::now().to_rfc3339())
+            .execute(pool)
+            .await;
+        }
     }
+
+    // SQLite-first persist of the dispatch row, then DIRECT pane injection of the
+    // [orchestrator:dispatch] prompt (with shared blackboard cards) — no Temporal.
+    let message_id = dispatch_and_inject(
+        pool,
+        session,
+        from_role,
+        to_role,
+        task_id,
+        summary,
+        &files,
+        next_action,
+        priority,
+    )
+    .await?;
 
     Ok(ok_text(format!(
         "Dispatched task {task_id} to {to_role}. Message ID: {message_id}"
@@ -804,24 +1081,8 @@ async fn orchestrator_inbox_inner(pool: &SqlitePool, params: &Value) -> anyhow::
         })
         .unwrap_or_default();
 
-    let config = crate::config::Config::load()?;
-    let wf_id = orchestrator_wf_id(session);
-
-    // 1. Clear messages if requested (signal orch.clearInbox).
+    // 1. Clear messages if requested — SQLite only (no Temporal hop).
     if !clear_ids.is_empty() {
-        let clear_payload = serde_json::to_string(&clear_ids)?;
-        if let Err(e) = temporal_signal(
-            &config.temporal_address,
-            &config.temporal_namespace,
-            &wf_id,
-            "orch.clearInbox",
-            &clear_payload,
-        )
-        .await
-        {
-            warn!(error = %e, "orch.clearInbox signal failed");
-        }
-
         for id in &clear_ids {
             let _ = sqlx::query("UPDATE inbox_messages SET cleared = 1 WHERE message_id = ?")
                 .bind(id)
@@ -1545,4 +1806,66 @@ pub async fn handle_blocker(pool: &SqlitePool, args: Value) -> anyhow::Result<Va
         mapped_args["summary"] = json!("Encountered a blocker");
     }
     handle_report_status(pool, mapped_args).await
+}
+
+/// Tool: devorch_event_subscribe — register `role`'s interest in `event_type`.
+///
+/// Input: `{ session, role, event_type }`
+pub async fn handle_event_subscribe(pool: &SqlitePool, args: Value) -> anyhow::Result<Value> {
+    let session = require_str(&args, "session").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let role = require_str(&args, "role").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let event_type = require_str(&args, "event_type").map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    queries::add_subscription(pool, session, event_type, role).await?;
+    Ok(ok_text(format!(
+        "Subscribed {role} to event '{event_type}' for {session}."
+    )))
+}
+
+/// Tool: devorch_event_publish — fan out an MCP event to subscribed busy panes.
+///
+/// Input: `{ session, event_type, publisher, payload? }`
+pub async fn handle_event_publish(pool: &SqlitePool, args: Value) -> anyhow::Result<Value> {
+    let session = require_str(&args, "session").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let event_type = require_str(&args, "event_type").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let publisher = require_str(&args, "publisher").map_err(|e| anyhow::anyhow!("{e}"))?;
+    let payload = args.get("payload").cloned().unwrap_or(Value::Null);
+
+    let fanout = publish_event(pool, session, event_type, publisher, &payload).await?;
+    Ok(ok_text(format!(
+        "Published '{event_type}' from {publisher}; injected to {fanout} subscribed busy pane(s)."
+    )))
+}
+
+/// Fan out an MCP event to every subscribed role whose pane is busy. Returns the
+/// number of panes injected. Reusable by an internal publish path too.
+pub async fn publish_event(
+    pool: &SqlitePool,
+    session: &str,
+    event_type: &str,
+    publisher: &str,
+    payload: &Value,
+) -> anyhow::Result<usize> {
+    let roles = queries::list_subscribed_roles(pool, session, event_type).await?;
+    if roles.is_empty() {
+        return Ok(0);
+    }
+    let agents = queries::get_agents_for_session(pool, session).await?;
+    let text = format_mcp_event(event_type, publisher, payload);
+
+    let mut count = 0;
+    for role in roles {
+        // Only deliver to busy subscribed panes (parity with the TS broadcast,
+        // which targeted active execution windows).
+        let is_busy = agents
+            .iter()
+            .find(|a| a.role == role)
+            .map(|a| a.status == "busy")
+            .unwrap_or(false);
+        if is_busy {
+            try_inject(pool, session, &role, &text).await;
+            count += 1;
+        }
+    }
+    Ok(count)
 }

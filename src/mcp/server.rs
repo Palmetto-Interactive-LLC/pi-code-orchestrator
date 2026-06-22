@@ -138,6 +138,12 @@ impl McpServer {
                     "devorch_peer_message" => {
                         tools::handle_peer_message(&self.pool, arguments).await
                     }
+                    "devorch_event_subscribe" => {
+                        tools::handle_event_subscribe(&self.pool, arguments).await
+                    }
+                    "devorch_event_publish" => {
+                        tools::handle_event_publish(&self.pool, arguments).await
+                    }
                     _ => Err(anyhow::anyhow!("Unknown tool: {}", name)),
                 };
 
@@ -339,6 +345,33 @@ fn tools_schema() -> Value {
                 },
                 "required": ["session", "from_role", "to_role", "info"]
             }
+        },
+        {
+            "name": "devorch_event_subscribe",
+            "description": "Subscribe a role to an MCP event type for the session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session":    { "type": "string", "description": "Current session ID" },
+                    "role":       { "type": "string", "description": "Subscribing role" },
+                    "event_type": { "type": "string", "description": "Event type to subscribe to" }
+                },
+                "required": ["session", "role", "event_type"]
+            }
+        },
+        {
+            "name": "devorch_event_publish",
+            "description": "Publish an MCP event, fanned out to subscribed busy panes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session":    { "type": "string", "description": "Current session ID" },
+                    "event_type": { "type": "string", "description": "Event type" },
+                    "publisher":  { "type": "string", "description": "Publishing role/identity" },
+                    "payload":    { "type": "object", "description": "Arbitrary JSON payload" }
+                },
+                "required": ["session", "event_type", "publisher"]
+            }
         }
     ])
 }
@@ -388,12 +421,12 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_contains_all_nine_tools() {
+    fn tools_list_contains_all_tools() {
         let names = tool_names();
         assert_eq!(
             names.len(),
-            9,
-            "expected exactly 9 tools, got {}",
+            11,
+            "expected exactly 11 tools, got {}",
             names.len()
         );
         for expected in &[
@@ -406,6 +439,8 @@ mod tests {
             "devorch_get_setup_instructions",
             "devorch_report_status",
             "devorch_peer_message",
+            "devorch_event_subscribe",
+            "devorch_event_publish",
         ] {
             assert!(
                 names.contains(&expected.to_string()),

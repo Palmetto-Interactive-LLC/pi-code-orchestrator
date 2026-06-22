@@ -15,7 +15,6 @@ enum HumanControlAction {
     Resume,
     Takeover,
     Release,
-    Note,
     Recover,
 }
 
@@ -163,7 +162,56 @@ pub async fn recover_agent(agent_id: &str) -> Result<()> {
     submit_human_control(agent_id, HumanControlAction::Recover, None).await
 }
 
-/// Send a human-authored note through Temporal-owned control.
+/// Send a human-authored note by injecting it DIRECTLY into the target role's
+/// pane (no HumanControlWorkflow / Temporal hop). SQLite remains the source of
+/// truth — we log the note as an event before delivering.
 pub async fn note_agent(agent_id: &str, message: &str) -> Result<()> {
-    submit_human_control(agent_id, HumanControlAction::Note, Some(message)).await
+    let pool = pool()?;
+    let session = required_env("DEVORCH_SESSION")?;
+
+    // Resolve the target: an exact agent id, or a role in the active session.
+    let agent = match queries::get_agent_by_id(pool, agent_id).await? {
+        Some(agent) => agent,
+        None => {
+            let session_agents = queries::get_agents_for_session(pool, &session).await?;
+            let normalized_role = match agent_id {
+                "orch" | "orchestrator" => "orchestrator",
+                other => other,
+            };
+            session_agents
+                .into_iter()
+                .find(|a| a.role == normalized_role)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Agent or Role {} not found in session {}",
+                        agent_id,
+                        session
+                    )
+                })?
+        }
+    };
+
+    if session != agent.session_id {
+        anyhow::bail!(
+            "DEVORCH_SESSION {} does not match agent {} session {}",
+            session,
+            agent_id,
+            agent.session_id
+        );
+    }
+
+    let text = format!("[human:note]\n{message}");
+    queries::log_event(
+        pool,
+        &agent.session_id,
+        Some(&agent.id),
+        "human_note",
+        Some(message),
+    )
+    .await?;
+
+    crate::delivery::inject::deliver_to_role(pool, &session, &agent.role, &text).await?;
+
+    info!(agent_id = %agent.id, role = %agent.role, "Human note injected directly into pane");
+    Ok(())
 }

@@ -1,3 +1,4 @@
+mod autoheal;
 mod config;
 mod db;
 mod delivery;
@@ -446,6 +447,9 @@ mod commands {
                 }
             }
         });
+
+        // Start the auto-heal nudge loop (30s scan; pokes silent busy agents).
+        autoheal::start_nudge_loop(db_pool.clone(), shutdown_rx.clone());
 
         info!("All subsystems started. Waiting for shutdown signal...");
         tokio::signal::ctrl_c().await?;
