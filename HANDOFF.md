@@ -1,4 +1,4 @@
-# Handoff: m7-lantern-code
+# Handoff: pi-code-orchestrator
 
 ## Current Direction
 
@@ -15,7 +15,7 @@ This is the opposite of the distributed model: no DevEnvironment `devorch-mcp-cl
 
 ## Repo Location
 
-- **GitHub**: https://github.com/Palmetto-Interactive-LLC/m7-lantern-code
+- **GitHub**: https://github.com/Palmetto-Interactive-LLC/pi-code-orchestrator
 - **Extracted from**: Legacy `DevEnvironment/tools/lantern/` (distributed model)
 
 ## What's Working

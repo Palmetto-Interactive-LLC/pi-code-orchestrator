@@ -5,8 +5,8 @@ Build, test, and extend Lantern Relay.
 ## Set Up the Repository
 
 ```bash
-git clone https://github.com/Palmetto-Interactive-LLC/m7-lantern-code.git
-cd m7-lantern-code
+git clone https://github.com/Palmetto-Interactive-LLC/pi-code-orchestrator.git
+cd pi-code-orchestrator
 cargo build
 ```
 

@@ -7,8 +7,8 @@ Install Lantern and its local dependencies on a new machine.
 From the repository root:
 
 ```bash
-git clone https://github.com/Palmetto-Interactive-LLC/m7-lantern-code.git
-cd m7-lantern-code
+git clone https://github.com/Palmetto-Interactive-LLC/pi-code-orchestrator.git
+cd pi-code-orchestrator
 ./scripts/install.sh
 ```
 
@@ -84,7 +84,7 @@ Optional: `~/.config/devorch/env` for API keys and agent environment configurati
 ## Reinstall After Code Changes
 
 ```bash
-cd m7-lantern-code
+cd pi-code-orchestrator
 cargo build --release
 cp target/release/lantern ~/.lantern/bin/lantern
 lantern restart
