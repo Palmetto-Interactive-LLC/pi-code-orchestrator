@@ -141,6 +141,24 @@ pub async fn launch(
         );
     }
 
+    // SOLO MODE (Option B): a single quiet Goose orchestrator window — no 8-pane
+    // team, no devorch. Goose coordinates via its own native subagents.
+    if agent_kind
+        .map(|a| a.eq_ignore_ascii_case("goose"))
+        .unwrap_or(false)
+    {
+        return launch_solo_goose(
+            &repo,
+            name,
+            number,
+            &session_id,
+            &worktree_root,
+            &config,
+            &db_pool,
+        )
+        .await;
+    }
+
     info!(repo = %repo.display(), session = %session_id, "Launching squad workspace");
 
     // Register root repo as trusted in Antigravity and Gemini
@@ -550,6 +568,111 @@ finally:
     println!("Orch pane is active. Switch to iTerm2 to begin.");
 
     Ok(())
+}
+
+/// Launch a single quiet Goose orchestrator window (Option B): one iTerm2 window
+/// with one `goose session` (claude-acp) in its own worktree. Goose orchestrates
+/// via its own native subagents — there is no devorch team and no 9-pane grid.
+/// beads remains available through the session's shell (`bd ...`).
+async fn launch_solo_goose(
+    repo: &Path,
+    name: &str,
+    number: u32,
+    session_id: &str,
+    worktree_root: &Path,
+    config: &crate::config::Config,
+    db_pool: &sqlx::SqlitePool,
+) -> Result<()> {
+    let _ = ensure_antigravity_project_trusted(repo);
+    let _ = ensure_gemini_project_trusted(repo);
+    info!(repo = %repo.display(), session = %session_id, "Launching solo goose orchestrator");
+
+    // One worktree for the solo session.
+    let worktree = create_orchestrator_worktree(repo, worktree_root, session_id).await?;
+    sync_skills_parallel(&[worktree.clone()]).await;
+
+    // Quiet goose orchestrator command (claude-acp, opus). No devorch — it
+    // delegates via goose's own subagents; beads is available via the shell.
+    let provider = crate::delivery::acp::goose_provider_for_agent("claude");
+    let model = crate::delivery::acp::goose_model_for_role("claude", "orchestrator");
+    let command = format!(
+        "env -u TERM_PROGRAM -u ITERM_SESSION_ID -u TERM_PROGRAM_VERSION \
+         GOOSE_PROVIDER={provider} GOOSE_MODEL={model} GOOSE_DISABLE_KEYRING=1 goose session"
+    );
+
+    let title = format!("GOOSE - {session_id}");
+    let iterm_session_id =
+        create_solo_window(&title, &worktree.to_string_lossy(), &command).await?;
+
+    // Register session + the single agent so `stopwork` can tear it down.
+    queries::insert_machine(db_pool, &config.machine_id).await?;
+    let session = Session {
+        id: session_id.to_string(),
+        machine_id: config.machine_id.clone(),
+        project_slug: name.to_string(),
+        slot_number: number as i64,
+        status: "active".to_string(),
+        created_at: chrono::Utc::now(),
+    };
+    queries::insert_session(db_pool, &session).await?;
+    let agent = Agent {
+        id: generate_id(&format!("agent-{}-goose-solo", session_id)),
+        session_id: session_id.to_string(),
+        role: "orchestrator".to_string(),
+        pane_id: Some(iterm_session_id.clone()),
+        worktree_path: worktree.to_string_lossy().to_string(),
+        branch: session_id.to_string(),
+        agent_kind: "goose".to_string(),
+        status: "idle".to_string(),
+        last_seen_at: Some(chrono::Utc::now()),
+        created_at: chrono::Utc::now(),
+    };
+    queries::insert_agent(db_pool, &agent).await?;
+    queries::insert_terminal_target(
+        db_pool,
+        &TerminalTarget {
+            agent_id: agent.id.clone(),
+            iterm_session_id: iterm_session_id.clone(),
+            pane_id: Some(iterm_session_id),
+            transport_status: "ready".to_string(),
+            last_seen_at: Some(chrono::Utc::now()),
+        },
+    )
+    .await?;
+
+    println!("\nSolo goose orchestrator window opened for session '{session_id}'.");
+    println!("Talk to it directly — it delegates via its own subagents (quiet, 1-window).");
+    Ok(())
+}
+
+/// Open a single iTerm2 window running `command` in `cwd`; returns its session id.
+async fn create_solo_window(title: &str, cwd: &str, command: &str) -> Result<String> {
+    let script_path = crate::terminal::locate_script("iterm_solo.py")?;
+    let output = Command::new("python3")
+        .args([
+            script_path.to_str().context("non-UTF-8 script path")?,
+            "--title",
+            title,
+            "--cwd",
+            cwd,
+            "--command",
+            command,
+        ])
+        .output()
+        .await
+        .context("failed to launch iterm_solo.py")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "iterm_solo.py failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let map: std::collections::HashMap<String, String> = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("iterm_solo.py returned invalid JSON: {}", stdout.trim()))?;
+    map.get("orchestrator")
+        .cloned()
+        .context("iterm_solo.py did not return an orchestrator session id")
 }
 
 fn get_agent_for_role(_role: &str) -> &'static str {
