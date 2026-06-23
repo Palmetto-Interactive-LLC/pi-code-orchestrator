@@ -182,6 +182,8 @@ pub async fn deliver_to_role(
 ) -> Result<()> {
     match current_transport() {
         Transport::Iterm => deliver_to_role_iterm(pool, session_id, role, text).await,
-        Transport::Acp => crate::delivery::acp::deliver_to_role_acp(pool, session_id, role, text).await,
+        Transport::Acp => {
+            crate::delivery::acp::deliver_to_role_acp(pool, session_id, role, text).await
+        }
     }
 }

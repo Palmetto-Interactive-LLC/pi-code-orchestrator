@@ -158,7 +158,15 @@ pub async fn deliver_to_role_acp(
     let task = text.to_string();
 
     tokio::spawn(async move {
-        match spawn_acp_worker(&agent_kind, &role, Path::new(&worktree), &task, &session, None).await
+        match spawn_acp_worker(
+            &agent_kind,
+            &role,
+            Path::new(&worktree),
+            &task,
+            &session,
+            None,
+        )
+        .await
         {
             Ok(output) if output.status.success() => {}
             Ok(output) => tracing::warn!(
@@ -215,6 +223,9 @@ mod tests {
     #[test]
     fn extension_quotes_paths_with_spaces() {
         assert_eq!(quote_if_needed("/no/space/lantern"), "/no/space/lantern");
-        assert_eq!(quote_if_needed("/has space/lantern"), "'/has space/lantern'");
+        assert_eq!(
+            quote_if_needed("/has space/lantern"),
+            "'/has space/lantern'"
+        );
     }
 }
