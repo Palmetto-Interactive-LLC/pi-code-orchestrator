@@ -24,10 +24,7 @@ jobs:
         uses: github/codeql-action/init@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3
         with:
           languages: rust
-          build-mode: autobuild
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3
+          build-mode: none
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3
