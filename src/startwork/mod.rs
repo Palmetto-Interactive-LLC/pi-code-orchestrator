@@ -141,14 +141,15 @@ pub async fn launch(
         );
     }
 
-    // DEFAULT MODEL: one headed Goose orchestrator pane that delegates to HEADLESS
-    // ACP specialists. Bare `startwork` and `startwork --agent goose` use this;
-    // the legacy all-panes team is opt-in via `--agent claude|codex|...`.
+    // SOLO GOOSE MODEL (opt-in): ONE headed, full-featured native `goose session`
+    // for focused fixes — no orchestrator role, no specialist fleet, no devorch.
+    // Only `startwork --agent goose` uses this. Bare `startwork` defaults to the
+    // legacy all-panes grid (claude per role).
     if agent_kind
         .map(|a| a.eq_ignore_ascii_case("goose"))
-        .unwrap_or(true)
+        .unwrap_or(false)
     {
-        return launch_headless(
+        return launch_solo_goose(
             &repo,
             name,
             number,
@@ -571,17 +572,20 @@ finally:
     Ok(())
 }
 
-/// Launch the DEFAULT model: ONE headed Goose orchestrator window/pane that
-/// delegates to HEADLESS Goose/ACP specialists running in the background.
+/// Launch the SOLO GOOSE model: ONE headed, full-featured native `goose session`
+/// in its own worktree, for focused fixes.
 ///
-/// - You type into and watch the single orchestrator pane.
-/// - The orchestrator dispatches via `devorch_dispatch_task`; because worker
-///   roles are registered WITHOUT a terminal target, `deliver_to_role` routes
-///   their work to background `goose run` specialists (see `delivery::acp`).
-/// - Specialists report back through devorch (→ orchestrator pane) and use beads.
-/// - `stopwork` closes the window, kills the headless workers, and removes the
-///   orchestrator + worker worktrees/branches.
-async fn launch_headless(
+/// - You talk to goose directly in a single window; it does the work itself (and
+///   can fan out via goose's own native subagents). No devorch, no specialist
+///   fleet, no orchestrator role.
+/// - Full-featured on purpose: we do NOT strip `TERM_PROGRAM`/`ITERM_SESSION_ID`
+///   (so goose sees iTerm2 and keeps its terminal-rich TUI), and we leave the
+///   keyring enabled. The provider stays `claude-acp` — the only zero-credential
+///   path (rides the Claude Code CLI subscription; no API key, matching this
+///   repo's no-secrets model).
+/// - beads is available via the shell. `stopwork` closes the window and removes
+///   the worktree/branch.
+async fn launch_solo_goose(
     repo: &Path,
     name: &str,
     number: u32,
@@ -592,41 +596,23 @@ async fn launch_headless(
 ) -> Result<()> {
     let _ = ensure_antigravity_project_trusted(repo);
     let _ = ensure_gemini_project_trusted(repo);
-    info!(repo = %repo.display(), session = %session_id, "Launching headless goose orchestrator + specialists");
+    info!(repo = %repo.display(), session = %session_id, "Launching solo goose session");
 
-    // Worktrees: one for the orchestrator, one per specialist (headless workers
-    // run in isolation). Specialists have no pane — only the orchestrator does.
-    let orch_worktree = create_orchestrator_worktree(repo, worktree_root, session_id).await?;
-    let worker_records =
-        create_worker_worktrees_parallel(repo, worktree_root, name, number).await?;
-    let mut roots: Vec<PathBuf> = vec![orch_worktree.clone()];
-    roots.extend(worker_records.iter().map(|(_, _, p, _)| p.clone()));
-    sync_skills_parallel(&roots).await;
+    // One worktree for the solo session.
+    let worktree = create_orchestrator_worktree(repo, worktree_root, session_id).await?;
+    sync_skills_parallel(&[worktree.clone()]).await;
 
-    let run_id = format!(
-        "{}-{}",
-        session_id,
-        chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-    );
-
-    // Headed orchestrator: goose session (claude-acp/opus) WITH devorch wired so
-    // it can dispatch. DEVORCH_SESSION is inherited by the devorch MCP child.
+    // Full-featured native goose: claude-acp/opus, terminal env left intact so
+    // iTerm2 features work, keyring on, no devorch extension.
     let provider = crate::delivery::acp::goose_provider_for_agent("claude");
     let model = crate::delivery::acp::goose_model_for_role("claude", "orchestrator");
-    let ext = shell_escape(&crate::delivery::acp::devorch_extension_value());
-    let command = format!(
-        "env -u TERM_PROGRAM -u ITERM_SESSION_ID -u TERM_PROGRAM_VERSION \
-         GOOSE_PROVIDER={provider} GOOSE_MODEL={model} GOOSE_DISABLE_KEYRING=1 \
-         DEVORCH_SESSION={session_id} DEVORCH_ROLE=orchestrator DEVORCH_RUN_ID={run_id} \
-         goose session --with-extension {ext}"
-    );
+    let command = format!("GOOSE_PROVIDER={provider} GOOSE_MODEL={model} goose session");
 
-    let title = format!("ORCH - {session_id}");
+    let title = format!("GOOSE - {session_id}");
     let iterm_session_id =
-        create_solo_window(&title, &orch_worktree.to_string_lossy(), &command).await?;
+        create_solo_window(&title, &worktree.to_string_lossy(), &command).await?;
 
-    // Register session, the orchestrator (with a terminal target → pane), and the
-    // paneless specialists (no terminal target → routed to headless ACP workers).
+    // Register session + the single agent so `stopwork` can tear it down.
     queries::insert_machine(db_pool, &config.machine_id).await?;
     let session = Session {
         id: session_id.to_string(),
@@ -637,61 +623,34 @@ async fn launch_headless(
         created_at: chrono::Utc::now(),
     };
     queries::insert_session(db_pool, &session).await?;
-
-    let orch = Agent {
-        id: generate_id(&format!("agent-{}-orch", session_id)),
+    let agent = Agent {
+        id: generate_id(&format!("agent-{}-goose-solo", session_id)),
         session_id: session_id.to_string(),
         role: "orchestrator".to_string(),
         pane_id: Some(iterm_session_id.clone()),
-        worktree_path: orch_worktree.to_string_lossy().to_string(),
+        worktree_path: worktree.to_string_lossy().to_string(),
         branch: session_id.to_string(),
         agent_kind: "goose".to_string(),
         status: "idle".to_string(),
         last_seen_at: Some(chrono::Utc::now()),
         created_at: chrono::Utc::now(),
     };
-    queries::insert_agent(db_pool, &orch).await?;
+    queries::insert_agent(db_pool, &agent).await?;
     queries::insert_terminal_target(
         db_pool,
         &TerminalTarget {
-            agent_id: orch.id.clone(),
+            agent_id: agent.id.clone(),
             iterm_session_id: iterm_session_id.clone(),
-            pane_id: Some(iterm_session_id.clone()),
+            pane_id: Some(iterm_session_id),
             transport_status: "ready".to_string(),
             last_seen_at: Some(chrono::Utc::now()),
         },
     )
     .await?;
 
-    for (team, branch, path, _) in &worker_records {
-        let worker = Agent {
-            id: generate_id(&format!("agent-{}-{}", session_id, team)),
-            session_id: session_id.to_string(),
-            role: team.clone(),
-            pane_id: None, // paneless → headless ACP specialist
-            worktree_path: path.to_string_lossy().to_string(),
-            branch: branch.clone(),
-            agent_kind: "goose".to_string(),
-            status: "idle".to_string(),
-            last_seen_at: Some(chrono::Utc::now()),
-            created_at: chrono::Utc::now(),
-        };
-        queries::insert_agent(db_pool, &worker).await?;
-    }
-
-    // Hand the orchestrator its role instructions once goose has booted.
-    let init = format!(
-        "Call the devorch_get_setup_instructions MCP tool now. session={session_id} role=orchestrator agent=goose repo_id={name} temporal_namespace={ns}",
-        ns = config.temporal_namespace
-    );
-    sleep(Duration::from_secs(10)).await;
-    if let Err(e) = crate::delivery::inject::inject_text(&iterm_session_id, &init).await {
-        warn!(error = %e, "failed to inject orchestrator setup prompt (send it manually)");
-    }
-
-    println!("\nHeadless orchestrator window opened for session '{session_id}'.");
-    println!("Type into the ORCH pane; it delegates to headless specialists (ai/dat/sec/ops/plt/ui/doc/qa).");
-    println!("Inspect: `lantern status` · beads `bd ready` · logs ~/.lantern/logs/ · stop: `stopwork {session_id}`");
+    println!("\nSolo goose window opened for session '{session_id}'.");
+    println!("Talk to it directly — single full-featured goose session for focused fixes.");
+    println!("Inspect: `lantern status` · beads `bd ready` · stop: `stopwork {session_id}`");
     Ok(())
 }
 
