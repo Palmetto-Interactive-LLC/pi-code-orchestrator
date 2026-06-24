@@ -58,7 +58,7 @@ Check that both `.tar.gz` assets and `SHA256SUMS` are attached and that the CI r
 ### 4. Test the installer
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Palmetto-Interactive-LLC/pi-code-orchestrator/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Palmetto-Interactive-LLC/Lantern/main/scripts/install.sh | sh
 ```
 
 ---

@@ -15,7 +15,7 @@ This is the opposite of the distributed model: no DevEnvironment `devorch-mcp-cl
 
 ## Repo Location
 
-- **GitHub**: https://github.com/Palmetto-Interactive-LLC/pi-code-orchestrator
+- **GitHub**: https://github.com/Palmetto-Interactive-LLC/Lantern
 - **Extracted from**: Legacy `DevEnvironment/tools/lantern/` (distributed model)
 
 ## What's Working

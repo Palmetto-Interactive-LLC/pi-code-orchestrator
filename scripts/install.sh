@@ -2,7 +2,7 @@
 # Lantern installer — downloads the latest release binary from GitHub Releases.
 #
 # Usage (curl):
-#   curl -fsSL https://raw.githubusercontent.com/Palmetto-Interactive-LLC/pi-code-orchestrator/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Palmetto-Interactive-LLC/Lantern/main/scripts/install.sh | sh
 #
 # Usage (local, from a source checkout):
 #   ./scripts/install.sh
@@ -13,7 +13,7 @@
 
 set -eu
 
-REPO="Palmetto-Interactive-LLC/pi-code-orchestrator"
+REPO="Palmetto-Interactive-LLC/Lantern"
 LANTERN_BIN="${HOME}/.lantern/bin"
 LANTERN_DATA="${HOME}/.lantern/data"
 LANTERN_LOGS="${HOME}/.lantern/logs"
