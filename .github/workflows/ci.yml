@@ -34,6 +34,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      - run: sudo apt-get install -y protobuf-compiler
       - run: cargo clippy --all-targets
 
   build-test:
@@ -46,5 +47,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
         with:
           toolchain: stable
+      - run: sudo apt-get install -y protobuf-compiler
       - run: cargo build --release
       - run: cargo test

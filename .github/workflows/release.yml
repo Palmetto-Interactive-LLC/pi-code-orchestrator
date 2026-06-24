@@ -35,6 +35,9 @@ jobs:
           toolchain: 1.86.0
           targets: ${{ matrix.target }}
 
+      - name: Install protobuf compiler
+        run: brew install protobuf
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
