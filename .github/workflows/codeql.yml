@@ -16,6 +16,9 @@ jobs:
   analyze:
     name: Analyze (rust)
     runs-on: ubuntu-latest
+    # Non-blocking on private repos without GHAS: SARIF upload requires public
+    # visibility or a GHAS license. Analysis still runs; results upload once public.
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
