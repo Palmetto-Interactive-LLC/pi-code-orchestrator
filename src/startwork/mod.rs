@@ -189,16 +189,21 @@ pub async fn launch(
     // Write the Python input router script for this session
     let router_script_path = format!("/tmp/devorch-input-router-{}.py", session_id);
     let router_script_content = format!(
-        r#"import sys, os, subprocess, tty, termios, select
+        r#"import sys, os, subprocess, select
+try:
+    import readline
+    readline.set_history_length(100)
+except ImportError:
+    pass
 session = '{session_id}'
 sys.stdout.write(f'\x1b]0;INPUT - {{session}}\x07\x1b]1;INPUT - {{session}}\x07\x1b]2;INPUT - {{session}}\x07')
 sys.stdout.flush()
 print('\x1b[1;36m====================================================\x1b[0m')
 print('\x1b[1;37m             ORCHESTRATOR INPUT ROUTER             \x1b[0m')
 print('\x1b[1;36m====================================================\x1b[0m')
-print('Type your note or command. Use arrow keys/backspace to edit.')
-print('  - Enter submits immediately if only one line.')
-print('  - If multiline (after paste or newline), press Ctrl-D to submit.')
+print('Type your note or command. Press Enter to submit.')
+print('  - Arrow keys and backspace work for editing.')
+print('  - For multiline, type or paste lines then press Ctrl-D to submit.')
 print('  - Ctrl-C aborts current input.')
 print('Type "/<role> <command>" to route to a specific worker window.')
 print('  (Available roles: ai, dat, sec, ops, plt, ui, doc, qa)\n')
@@ -278,160 +283,22 @@ def process_cmd(cmd):
             print(f"Error injecting to iTerm2 pane: {{e}}", file=sys.stderr)
 
 def edit_loop():
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        sys.stdout.write('\x1b[?2004h')
-        sys.stdout.flush()
-
-        lines = [""]
-        cy = 0
-        cx = 0
-
-        is_first = True
-        len_prev = 0
-        cy_prev = 0
-
-        while True:
-            # 1. Redraw
-            if not is_first:
-                up_count = len_prev - cy_prev
-                if up_count > 0:
-                    sys.stdout.write(f'\x1b[{{up_count}}A')
-                sys.stdout.write('\r')
-            else:
-                is_first = False
-
-            sys.stdout.write('\x1b[J')
-
-            # Print prompt and lines
-            sys.stdout.write('\x1b[1;32m[INPUT] ❯ \x1b[0m' + lines[0] + '\r\n')
-            for line in lines[1:]:
-                sys.stdout.write('          ' + line + '\r\n')
-
-            # Place cursor
-            up_count = len(lines) - cy
-            if up_count > 0:
-                sys.stdout.write(f'\x1b[{{up_count}}A')
-            sys.stdout.write('\r')
-            col = 10 + cx
-            if col > 0:
-                sys.stdout.write(f'\x1b[{{col}}C')
-            sys.stdout.flush()
-
-            len_prev = len(lines)
-            cy_prev = cy
-
-            # 2. Get key
-            key = os.read(fd, 4096).decode('utf-8', errors='ignore')
-            if not key:
-                continue
-
-            # Ctrl-C / Ctrl-G (Abort)
-            if '\x03' in key or '\x07' in key:
-                raise KeyboardInterrupt()
-
-            # Ctrl-D / Ctrl-S / Ctrl-X (Submit)
-            elif '\x04' in key or '\x13' in key or '\x18' in key:
+    lines = []
+    while True:
+        try:
+            prompt = '\x1b[1;32m[INPUT] ❯ \x1b[0m' if not lines else '          '
+            line = input(prompt)
+            lines.append(line)
+            # If no more input arrives within 50 ms (single line typed), submit now.
+            # Multiline paste fills the buffer immediately so select returns True.
+            if not select.select([sys.stdin], [], [], 0.05)[0]:
                 break
-
-            # Arrow Up
-            elif key == '\x1b[A' or key == '\x1bOA':
-                if cy > 0:
-                    cy -= 1
-                    cx = min(cx, len(lines[cy]))
-
-            # Arrow Down
-            elif key == '\x1b[B' or key == '\x1bOB':
-                if cy < len(lines) - 1:
-                    cy += 1
-                    cx = min(cx, len(lines[cy]))
-
-            # Arrow Right
-            elif key == '\x1b[C' or key == '\x1bOC':
-                if cx < len(lines[cy]):
-                    cx += 1
-                elif cx == len(lines[cy]) and cy < len(lines) - 1:
-                    cy += 1
-                    cx = 0
-
-            # Arrow Left
-            elif key == '\x1b[D' or key == '\x1bOD':
-                if cx > 0:
-                    cx -= 1
-                elif cx == 0 and cy > 0:
-                    cy -= 1
-                    cx = len(lines[cy])
-
-            # Backspace / Delete
-            elif key == '\x7f' or key == '\x08':
-                if cx > 0:
-                    lines[cy] = lines[cy][:cx-1] + lines[cy][cx:]
-                    cx -= 1
-                elif cx == 0 and cy > 0:
-                    prev_len = len(lines[cy-1])
-                    lines[cy-1] += lines[cy]
-                    lines.pop(cy)
-                    cy -= 1
-                    cx = prev_len
-
-            # Enter
-            elif key == '\r' or key == '\n':
-                if len(lines) == 1:
-                    break
-                else:
-                    right = lines[cy][cx:]
-                    lines[cy] = lines[cy][:cx]
-                    lines.insert(cy + 1, right)
-                    cy += 1
-                    cx = 0
-
-            # Bracketed paste start
-            elif '\x1b[200~' in key:
-                pasted_text = ""
-                if '\x1b[201~' in key:
-                    parts = key.split('\x1b[200~', 1)[1].split('\x1b[201~', 1)
-                    pasted_text = parts[0]
-                else:
-                    parts = key.split('\x1b[200~', 1)
-                    pasted_chunks = [parts[1]]
-                    while True:
-                        chunk = os.read(fd, 4096).decode('utf-8', errors='ignore')
-                        if '\x1b[201~' in chunk:
-                            pasted_chunks.append(chunk.split('\x1b[201~', 1)[0])
-                            break
-                        pasted_chunks.append(chunk)
-                    pasted_text = "".join(pasted_chunks)
-
-                pasted_lines = pasted_text.split('\n')
-                if len(pasted_lines) == 1:
-                    lines[cy] = lines[cy][:cx] + pasted_lines[0] + lines[cy][cx:]
-                    cx += len(pasted_lines[0])
-                else:
-                    left = lines[cy][:cx]
-                    right = lines[cy][cx:]
-                    lines[cy] = left + pasted_lines[0]
-                    for i, pline in enumerate(pasted_lines[1:-1]):
-                        lines.insert(cy + i + 1, pline)
-                    lines.insert(cy + len(pasted_lines) - 1, pasted_lines[-1] + right)
-                    cy += len(pasted_lines) - 1
-                    cx = len(pasted_lines[-1])
-
-            # Regular characters
-            elif len(key) > 0 and not key.startswith('\x1b'):
-                lines[cy] = lines[cy][:cx] + key + lines[cy][cx:]
-                cx += len(key)
-
-    finally:
-        up_count = len_prev - cy_prev
-        if up_count > 0:
-            sys.stdout.write(f'\x1b[{{up_count}}B')
-        sys.stdout.write('\r\x1b[?2004l\r\n')
-        sys.stdout.flush()
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-    return "\n".join(lines)
+        except EOFError:
+            # Ctrl-D: submit whatever has been collected
+            break
+        except KeyboardInterrupt:
+            raise
+    return '\n'.join(lines)
 
 try:
     while True:
@@ -439,9 +306,10 @@ try:
             cmd = edit_loop()
         except (KeyboardInterrupt, EOFError):
             break
-        process_cmd(cmd)
+        if cmd.strip():
+            process_cmd(cmd)
 finally:
-    sys.stdout.write('\x1b[?2004l')
+    sys.stdout.write('\r\n')
     sys.stdout.flush()"#,
         session_id = session_id,
         run_id = run_id,
