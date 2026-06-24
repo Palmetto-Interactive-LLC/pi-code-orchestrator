@@ -75,7 +75,16 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" dist/*.tar.gz dist/SHA256SUMS --clobber
+            EXISTING=$(gh release view "${TAG}" --json assets \
+              --jq '[.assets[].name] | map(select(endswith(".tar.gz"))) | length')
+            if [ "${EXISTING}" -gt 0 ]; then
+              echo "Release ${TAG} already has ${EXISTING} tarball asset(s) — skipping upload"
+              gh release view "${TAG}" --json tagName,assets \
+                --jq '{tag: .tagName, assets: [.assets[].name]}'
+            else
+              echo "Release ${TAG} exists without tarball assets — uploading"
+              gh release upload "${TAG}" dist/*.tar.gz dist/SHA256SUMS
+            fi
           else
             gh release create "${TAG}" \
               --title "Lantern ${TAG}" \
