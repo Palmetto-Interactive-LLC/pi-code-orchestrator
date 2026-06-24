@@ -44,7 +44,9 @@ lantern status        # Show all active squads
 lantern stopwork myproject-1  # Tear down a squad
 ```
 
-## How It Works
+The binary is produced at `target/release/lantern`.
+
+### Test
 
 - **MCP Server**: Agents report status, send peer messages, query team state via `devorch_*` tools
 - **Local Runner**: Creates iTerm2 window with colored panes (one per role), git worktrees for isolation
