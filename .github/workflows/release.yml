@@ -39,9 +39,11 @@ jobs:
         run: cargo build --release --target x86_64-apple-darwin
 
       - name: Package
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         shell: bash
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="$RELEASE_TAG"
           mkdir -p dist
           for TARGET in aarch64-apple-darwin x86_64-apple-darwin; do
             ASSET="lantern-${TAG}-${TARGET}"
@@ -76,8 +78,9 @@ jobs:
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="$RELEASE_TAG"
           if gh release view "${TAG}" >/dev/null 2>&1; then
             EXISTING=$(gh release view "${TAG}" --json assets \
               --jq '[.assets[].name] | map(select(endswith(".tar.gz"))) | length')
