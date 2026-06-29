@@ -131,3 +131,30 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - Do not commit or push without clear authority from the active profile or the current user request.
 - If a required sync or push is blocked, stop and report the exact command and error.
 <!-- END BEADS INTEGRATION -->
+
+<!-- BEGIN GITHUB SSH TRANSPORT POLICY v:1 -->
+## GitHub SSH Transport Policy
+
+GitHub Git transport is SSH-only through the configured per-account host aliases.
+Before any GitHub operation, run `git remote -v` and use that remote exactly for
+`git fetch`, `git pull`, `git push`, and Beads/Dolt sync.
+
+Allowed canonical GitHub SSH aliases:
+
+- `git@github-meridian7:...`
+- `git@github-palmetto:...`
+- `git@github-personal:...`
+- `git@github-shelterfitness:...`
+
+Never rewrite a GitHub remote to HTTPS. Never use `https://github.com/...` for
+Git transport. Never use direct `git@github.com:...`. Treat legacy duplicate
+aliases such as `github.com-client`, `github.com-work`, and `github.com-primary`
+as drift and normalize them to the canonical aliases above.
+
+`gh` and GitHub API auth are separate from Git transport. A broken or wrong
+`gh` account does not block branch fetch/push when SSH works. Use `gh` only for
+PR/API operations, and prove Git access with `git ls-remote <remote-url>` or
+`ssh -T git@<alias>`, not with `gh auth status`.
+
+Reference: `/Users/matt/Development/AGENT-GITHUB-MODEL.md`.
+<!-- END GITHUB SSH TRANSPORT POLICY -->

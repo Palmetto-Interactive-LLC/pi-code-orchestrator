@@ -141,3 +141,30 @@ Treat this repository as security-sensitive production software. Reviews should 
 - Flag direct human-review requirements that would deadlock a solo developer, such as required approving reviews or required CODEOWNERS review, as P1.
 - Flag production deployment paths that bypass protected `main`, immutable GitHub Releases with `v*` tags, environment branch/tag policies, or required status checks as P1.
 - Flag logging of secrets, PII, cloud tokens, OIDC tokens, or full GitHub event payloads as P1.
+
+<!-- BEGIN GITHUB SSH TRANSPORT POLICY v:1 -->
+## GitHub SSH Transport Policy
+
+GitHub Git transport is SSH-only through the configured per-account host aliases.
+Before any GitHub operation, run `git remote -v` and use that remote exactly for
+`git fetch`, `git pull`, `git push`, and Beads/Dolt sync.
+
+Allowed canonical GitHub SSH aliases:
+
+- `git@github-meridian7:...`
+- `git@github-palmetto:...`
+- `git@github-personal:...`
+- `git@github-shelterfitness:...`
+
+Never rewrite a GitHub remote to HTTPS. Never use `https://github.com/...` for
+Git transport. Never use direct `git@github.com:...`. Treat legacy duplicate
+aliases such as `github.com-client`, `github.com-work`, and `github.com-primary`
+as drift and normalize them to the canonical aliases above.
+
+`gh` and GitHub API auth are separate from Git transport. A broken or wrong
+`gh` account does not block branch fetch/push when SSH works. Use `gh` only for
+PR/API operations, and prove Git access with `git ls-remote <remote-url>` or
+`ssh -T git@<alias>`, not with `gh auth status`.
+
+Reference: `/Users/matt/Development/AGENT-GITHUB-MODEL.md`.
+<!-- END GITHUB SSH TRANSPORT POLICY -->
